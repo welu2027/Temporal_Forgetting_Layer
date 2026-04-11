@@ -218,17 +218,25 @@ def compute_pair_lens(
     step_A:      int,
     step_B:      int,
     device:      str = "cuda",
+    device_A:    str | None = None,
+    device_B:    str | None = None,
     position:    int = -1,
 ) -> PairLensResult:
-    """Run logit-lens on both models and return a PairLensResult."""
+    """Run logit-lens on both models and return a PairLensResult.
+
+    device_A / device_B override `device` for each model independently,
+    enabling dual-GPU setups (e.g. model_A on cuda:0, model_B on cuda:1).
+    """
+    dev_A = device_A or device
+    dev_B = device_B or device
     lens_A = compute_lens(model_A, tokenizer, prompt, answer,
                           model_label=f"step_{step_A}",
                           problem_index=problem_index,
-                          device=device, position=position)
+                          device=dev_A, position=position)
     lens_B = compute_lens(model_B, tokenizer, prompt, answer,
                           model_label=f"step_{step_B}",
                           problem_index=problem_index,
-                          device=device, position=position)
+                          device=dev_B, position=position)
     return PairLensResult(
         problem_index=problem_index,
         task=task,

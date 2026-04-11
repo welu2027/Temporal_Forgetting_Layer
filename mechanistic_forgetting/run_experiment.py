@@ -18,8 +18,11 @@ Step 6   Save results and print a concise summary table
 
 Usage
 -----
-    # Full run on GPU (recommended):
+    # Full run on a single GPU:
     python run_experiment.py
+
+    # Dual-GPU (Kaggle 2x T4): model_A on cuda:0, model_B on cuda:1
+    python run_experiment.py --device-a cuda:0 --device-b cuda:1
 
     # Quick test on CPU with 2 problems, logit-lens only:
     python run_experiment.py --device cpu --max-problems 2 --analyses logit_lens
@@ -32,15 +35,17 @@ Usage
 
 Flags
 -----
-    --device        cuda | cpu  (default: cuda)
-    --max-problems  int         (default: config.MAX_PROBLEMS_FOR_ACTIVATION)
-    --step-a        int         (override primary pair A)
-    --step-b        int         (override primary pair B)
-    --task          str         (AIME | AIME25 | AMC | all)  default: all
-    --analyses      comma-list  (logit_lens,patching,representation,attention,weight_drift)
-    --skip-compute  flag        skip model loading; reuse saved JSON results
-    --capture-attn  flag        also capture attention weights (slower, ~2x memory)
-    --tag           str         suffix for output files
+    --device        cuda | cpu        fallback device for both models (default: cuda)
+    --device-a      cuda:0 | cuda:1   device for checkpoint A (overrides --device)
+    --device-b      cuda:0 | cuda:1   device for checkpoint B (overrides --device)
+    --max-problems  int               (default: config.MAX_PROBLEMS_FOR_ACTIVATION)
+    --step-a        int               (override primary pair A)
+    --step-b        int               (override primary pair B)
+    --task          str               (AIME | AIME25 | AMC | all)  default: all
+    --analyses      comma-list        (logit_lens,patching,representation,attention,weight_drift)
+    --skip-compute  flag              skip model loading; reuse saved JSON results
+    --capture-attn  flag              also capture attention weights (slower, ~2x memory)
+    --tag           str               suffix for output files
 """
 
 from __future__ import annotations
@@ -106,28 +111,44 @@ def build_prompt(problem_text: str, tokenizer, apply_chat_template: bool = True)
 # ─── Model loading ────────────────────────────────────────────────────────────
 
 def load_model_and_tokenizer(model_id: str, device: str = "cuda", dtype: str = "bfloat16"):
-    """Load a HuggingFace model and tokenizer, returning (model, tokenizer)."""
+    """Load a HuggingFace model and tokenizer, returning (model, tokenizer).
+
+    device can be "cuda" (auto device_map), "cuda:0", "cuda:1", or "cpu".
+    When a specific CUDA index is given (e.g. "cuda:0"), the model is placed
+    entirely on that GPU — allowing two models to coexist on separate GPUs.
+    """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
                    "float32": torch.float32}.get(dtype, torch.bfloat16)
 
-    print(f"  Loading tokenizer from {model_id} …")
+    print(f"  Loading tokenizer from {model_id} ...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"  Loading model from {model_id} …")
+    print(f"  Loading model from {model_id} onto {device} ...")
     t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch_dtype,
-        device_map=device if device == "cuda" else None,
-        trust_remote_code=True,
-    )
-    if device == "cpu":
-        model = model.to(device)
+
+    # "cuda" (no index) -> use HF auto device_map (spreads across all visible GPUs)
+    # "cuda:N"          -> pin entirely to GPU N (two-GPU split)
+    # "cpu"             -> CPU
+    if device == "cuda":
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch_dtype,
+            device_map="auto", trust_remote_code=True,
+        )
+    elif device.startswith("cuda:"):
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch_dtype,
+            device_map={"": device}, trust_remote_code=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch_dtype, trust_remote_code=True,
+        ).to(device)
+
     model.eval()
     print(f"  Loaded in {time.time()-t0:.1f}s")
     return model, tokenizer
@@ -137,7 +158,12 @@ def load_model_and_tokenizer(model_id: str, device: str = "cuda", dtype: str = "
 
 def main():
     parser = argparse.ArgumentParser(description="Mechanistic forgetting analysis")
-    parser.add_argument("--device",        default=DEVICE)
+    parser.add_argument("--device",        default=DEVICE,
+                        help="Fallback device for both models (cuda/cpu)")
+    parser.add_argument("--device-a",      default=None,
+                        help="Device for checkpoint A, e.g. cuda:0  (overrides --device)")
+    parser.add_argument("--device-b",      default=None,
+                        help="Device for checkpoint B, e.g. cuda:1  (overrides --device)")
     parser.add_argument("--max-problems",  type=int, default=MAX_PROBLEMS_FOR_ACTIVATION)
     parser.add_argument("--step-a",        type=int, default=None)
     parser.add_argument("--step-b",        type=int, default=None)
@@ -148,8 +174,11 @@ def main():
     parser.add_argument("--tag",           default="")
     args = parser.parse_args()
 
-    active = set(args.analyses.split(","))
-    tag    = args.tag
+    active  = set(args.analyses.split(","))
+    tag     = args.tag
+    # Resolve per-model devices
+    dev_A   = args.device_a or args.device
+    dev_B   = args.device_b or args.device
 
     # ── Step 1: identify forgotten problems ────────────────────────────────────
     print("\n" + "="*65)
@@ -200,8 +229,11 @@ def main():
     id_A = ckpt_id(primary[0])
     id_B = ckpt_id(primary[1])
 
-    model_A, tokenizer = load_model_and_tokenizer(id_A, args.device)
-    model_B, _         = load_model_and_tokenizer(id_B, args.device)
+    print(f"  model_A ({id_A}) -> {dev_A}")
+    print(f"  model_B ({id_B}) -> {dev_B}")
+
+    model_A, tokenizer = load_model_and_tokenizer(id_A, dev_A)
+    model_B, _         = load_model_and_tokenizer(id_B, dev_B)
 
     # ── Step 4: build prompts ──────────────────────────────────────────────────
     prompts = [build_prompt(fp.problem_text, tokenizer) for fp in fp_list]
@@ -223,7 +255,8 @@ def main():
                 task=fp.task,
                 step_A=primary[0],
                 step_B=primary[1],
-                device=args.device,
+                device_A=dev_A,
+                device_B=dev_B,
             )
             lens_results.append(pair_lens)
             # Print divergence layer
@@ -261,7 +294,8 @@ def main():
                 task=fp.task,
                 step_A=primary[0],
                 step_B=primary[1],
-                device=args.device,
+                device_A=dev_A,
+                device_B=dev_B,
                 verbose=True,
             )
             patch_results.append(pr)
@@ -291,8 +325,8 @@ def main():
         stores_B = []
         for i, (fp, prompt) in enumerate(zip(fp_list, prompts)):
             print(f"  Collecting activations for problem {i+1}/{len(fp_list)} …")
-            sA = run_with_hooks(model_A, tokenizer, prompt, device=args.device)
-            sB = run_with_hooks(model_B, tokenizer, prompt, device=args.device)
+            sA = run_with_hooks(model_A, tokenizer, prompt, device=dev_A)
+            sB = run_with_hooks(model_B, tokenizer, prompt, device=dev_B)
             stores_A.append(sA)
             stores_B.append(sB)
 
@@ -324,9 +358,9 @@ def main():
         attn_stores_B = []
         for i, (fp, prompt) in enumerate(zip(fp_list, prompts)):
             print(f"  Collecting attention for problem {i+1}/{len(fp_list)} …")
-            sA = run_with_hooks(model_A, tokenizer, prompt, device=args.device,
+            sA = run_with_hooks(model_A, tokenizer, prompt, device=dev_A,
                                 capture_attn_weights=True)
-            sB = run_with_hooks(model_B, tokenizer, prompt, device=args.device,
+            sB = run_with_hooks(model_B, tokenizer, prompt, device=dev_B,
                                 capture_attn_weights=True)
             attn_stores_A.append(sA)
             attn_stores_B.append(sB)

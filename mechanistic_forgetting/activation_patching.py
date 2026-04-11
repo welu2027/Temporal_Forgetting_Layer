@@ -141,28 +141,39 @@ def run_patching_for_problem(
     step_B:    int,
     patch_targets: list[str] = None,
     device:    str = "cuda",
+    device_A:  str | None = None,
+    device_B:  str | None = None,
     position:  int = -1,
     verbose:   bool = False,
 ) -> ProblemPatchingResult:
     """
     Run the full causal patching sweep for one problem.
 
+    device_A / device_B override `device` for each model independently,
+    enabling dual-GPU setups (model_A on cuda:0, model_B on cuda:1).
+    The source activations (from model_A) are stored on CPU and automatically
+    moved to model_B's device during patching, so cross-device patching works
+    transparently.
+
     For each layer l and each target in patch_targets:
-        1. Run model_A clean → store_A
-        2. Run model_B clean → store_B   (baseline)
-        3. Run model_B with layer-l patch from store_A → patched_store
-        4. Record Δp
+        1. Run model_A clean -> store_A  (activations cached on CPU)
+        2. Run model_B clean -> store_B  (baseline)
+        3. Run model_B with layer-l patch from store_A -> patched_store
+        4. Record delta_p
     """
     if patch_targets is None:
         patch_targets = PATCH_TARGETS
+
+    dev_A = device_A or device
+    dev_B = device_B or device
 
     ans_ids = get_answer_token_ids(tokenizer, answer)
     if not ans_ids:
         print(f"Warning: could not tokenize answer {answer!r}")
 
     # ── Clean forward passes ────────────────────────────────────────────────
-    store_A = run_with_hooks(model_A, tokenizer, prompt, device=device)
-    store_B = run_with_hooks(model_B, tokenizer, prompt, device=device)
+    store_A = run_with_hooks(model_A, tokenizer, prompt, device=dev_A)
+    store_B = run_with_hooks(model_B, tokenizer, prompt, device=dev_B)
 
     prob_A = _answer_prob_from_store(model_A, tokenizer, store_A, ans_ids, position)
     prob_B = _answer_prob_from_store(model_B, tokenizer, store_B, ans_ids, position)
@@ -203,7 +214,7 @@ def run_patching_for_problem(
                 source_store=store_A,
                 patch_layer=l,
                 patch_target=target,
-                device=device,
+                device=dev_B,
             )
             prob_p = _answer_prob_from_store(
                 model_B, tokenizer, patched_store, ans_ids, position
