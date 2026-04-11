@@ -110,7 +110,8 @@ def build_prompt(problem_text: str, tokenizer, apply_chat_template: bool = True)
 
 # ─── Model loading ────────────────────────────────────────────────────────────
 
-def load_model_and_tokenizer(model_id: str, device: str = "cuda", dtype: str = "bfloat16"):
+def load_model_and_tokenizer(model_id: str, device: str = "cuda", dtype: str = "bfloat16",
+                             hf_token: str | None = None):
     """Load a HuggingFace model and tokenizer, returning (model, tokenizer).
 
     device can be "cuda" (auto device_map), "cuda:0", "cuda:1", or "cpu".
@@ -124,7 +125,8 @@ def load_model_and_tokenizer(model_id: str, device: str = "cuda", dtype: str = "
                    "float32": torch.float32}.get(dtype, torch.bfloat16)
 
     print(f"  Loading tokenizer from {model_id} ...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True,
+                                              token=hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -136,17 +138,17 @@ def load_model_and_tokenizer(model_id: str, device: str = "cuda", dtype: str = "
     # "cpu"             -> CPU
     if device == "cuda":
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch_dtype,
-            device_map="auto", trust_remote_code=True,
+            model_id, dtype=torch_dtype,
+            device_map="auto", trust_remote_code=True, token=hf_token,
         )
     elif device.startswith("cuda:"):
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch_dtype,
-            device_map={"": device}, trust_remote_code=True,
+            model_id, dtype=torch_dtype,
+            device_map={"": device}, trust_remote_code=True, token=hf_token,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch_dtype, trust_remote_code=True,
+            model_id, dtype=torch_dtype, trust_remote_code=True, token=hf_token,
         ).to(device)
 
     model.eval()
@@ -172,6 +174,8 @@ def main():
     parser.add_argument("--skip-compute",  action="store_true")
     parser.add_argument("--capture-attn",  action="store_true")
     parser.add_argument("--tag",           default="")
+    parser.add_argument("--hf-token",      default=os.environ.get("HF_TOKEN"),
+                        help="HuggingFace token (or set HF_TOKEN env var)")
     args = parser.parse_args()
 
     active  = set(args.analyses.split(","))
@@ -232,8 +236,8 @@ def main():
     print(f"  model_A ({id_A}) -> {dev_A}")
     print(f"  model_B ({id_B}) -> {dev_B}")
 
-    model_A, tokenizer = load_model_and_tokenizer(id_A, dev_A)
-    model_B, _         = load_model_and_tokenizer(id_B, dev_B)
+    model_A, tokenizer = load_model_and_tokenizer(id_A, dev_A, hf_token=args.hf_token)
+    model_B, _         = load_model_and_tokenizer(id_B, dev_B, hf_token=args.hf_token)
 
     # ── Step 4: build prompts ──────────────────────────────────────────────────
     prompts = [build_prompt(fp.problem_text, tokenizer) for fp in fp_list]
