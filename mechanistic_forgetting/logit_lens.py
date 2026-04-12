@@ -132,15 +132,18 @@ def _apply_lens_at_position(
     top1_tokens  = []
     top1_probs   = []
 
+    model_dtype = next(model.parameters()).dtype
+    model_device = next(model.parameters()).device
+
     for l, h in enumerate(store.residuals):
         # h: [seq, hidden]  (already CPU float)
         h_pos = h[position].unsqueeze(0).unsqueeze(0)   # [1, 1, H]
 
         # Apply the model's final layer-norm
-        h_pos_gpu = h_pos.to(model.device, dtype=model.dtype)
+        h_pos_gpu = h_pos.to(device=model_device, dtype=model_dtype)
         with torch.no_grad():
             h_normed = final_ln(h_pos_gpu)              # [1, 1, H]
-            logits   = lm_head(h_normed).reshape(-1)      # [vocab]
+            logits   = lm_head(h_normed).reshape(-1)    # [vocab]
             probs    = F.softmax(logits.float(), dim=-1)
 
         probs_cpu = probs.cpu()
