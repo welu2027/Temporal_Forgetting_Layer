@@ -140,7 +140,7 @@ def _apply_lens_at_position(
         h_pos_gpu = h_pos.to(model.device, dtype=model.dtype)
         with torch.no_grad():
             h_normed = final_ln(h_pos_gpu)              # [1, 1, H]
-            logits   = lm_head(h_normed).squeeze()      # [vocab]
+            logits   = lm_head(h_normed).reshape(-1)      # [vocab]
             probs    = F.softmax(logits.float(), dim=-1)
 
         probs_cpu = probs.cpu()
